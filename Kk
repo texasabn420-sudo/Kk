@@ -1,0 +1,641 @@
+-- Tables Helper v1.0
+-- Built from the Oct 26, 2026 remote breakdown (new brainrot tables game).
+-- Plain GUI, everything OFF, NOTHING auto-fires. Every action is a tap.
+-- Safe reads: Get* RemoteFunctions. Confirmed actions only (see below).
+-- Deliberately NOT included: RunCommand/admin commands, GrantTestBrainrots,
+-- StudioResetPlayerData, and every gameplay remote whose args are unknown
+-- (SitAtTable, LeaveTable, RebirthAction, RollKeyCrate, BuyChair, claims...).
+-- Those unlock in v1.1 once Remote Spy captures their real args.
+-- Delete no older copy: this is the first version of this script. 
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local VERSION = "v1.0"
+local TAG = "[Tables] "
+
+local function log(msg)
+	print(TAG .. msg)
+end
+
+-- ================= state =================
+local remoteCache = {}
+local lastMatchId = nil
+local lastRunToken = nil
+local lastPollId = nil
+local lastInvokeAt = 0
+local spyOn = false
+local signalOn = false
+local espPlayersOn = false
+local espTablesOn = false
+local speedOn = false
+local infJumpOn = false
+local noclipOn = false
+local savedSpeed = 16
+local spyOld = nil
+local signalConn = nil
+local noclipConn = nil
+local jumpConn = nil
+local charConn = nil
+local statusLabel = nil
+local playerLabels = {}
+local tableLabels = {}
+
+-- ================= helpers =================
+local function short(v, depth)
+	depth = depth or 0
+	local t = typeof(v)
+	if t == "string" then
+		if #v > 100 then return '"' .. string.sub(v, 1, 100) .. '..."' end
+		return '"' .. v .. '"'
+	elseif t == "number" or t == "boolean" then
+		return tostring(v)
+	elseif t == "table" then
+		if depth > 0 then return "table{...}" end
+		local keys = {}
+		local n = 0
+		for k in pairs(v) do
+			n = n + 1
+			if #keys < 10 then keys[#keys + 1] = tostring(k) end
+		end
+		return "table(" .. n .. " keys: " .. table.concat(keys, ", ") .. ")"
+	elseif t == "Instance" then
+		return v.ClassName .. ":" .. v.Name
+	else
+		return t
+	end
+end
+
+local function findRemote(name)
+	if remoteCache[name] then return remoteCache[name] end
+	local folder = ReplicatedStorage:FindFirstChild("Remotes")
+	local found = folder and folder:FindFirstChild(name)
+	if not found then
+		for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
+			if inst.Name == name and (inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction")) then
+				found = inst
+				break
+			end
+		end
+	end
+	if found then
+		remoteCache[name] = found
+		log("remote " .. name .. " found at " .. found:GetFullName())
+	else
+		log("remote " .. name .. " NOT FOUND")
+	end
+	return found
+end
+
+local function setStatus(text)
+	if statusLabel then
+		statusLabel.Text = text
+	end
+	log(text)
+end
+
+local function showResult(name, ok, res)
+	if not ok then
+		setStatus(name .. " error: " .. string.sub(tostring(res), 1, 90))
+		return
+	end
+	if type(res) == "table" then
+		local keys = {}
+		local n = 0
+		for k in pairs(res) do
+			n = n + 1
+			if #keys < 10 then keys[#keys + 1] = tostring(k) end
+		end
+		setStatus(name .. " ok (" .. n .. " keys: " .. table.concat(keys, ", ") .. ")")
+		local shown = 0
+		for k, v in pairs(res) do
+			shown = shown + 1
+			if shown > 30 then break end
+			print(TAG .. name .. "." .. tostring(k) .. " = " .. short(v))
+		end
+	else
+		setStatus(name .. " ok: " .. short(res))
+	end
+end
+
+-- Dashboard reads are throttled: GetRuntimeState is server rate-limited.
+local function dashboard(name)
+	if os.clock() - lastInvokeAt < 1 then
+		setStatus("wait a sec (rate limit)")
+		return
+	end
+	lastInvokeAt = os.clock()
+	local r = findRemote(name)
+	if not r then
+		setStatus(name .. " not found")
+		return
+	end
+	if not r:IsA("RemoteFunction") then
+		setStatus(name .. " is not a RemoteFunction")
+		return
+	end
+	local ok, res = pcall(r.InvokeServer, r)
+	showResult(name, ok, res)
+end
+
+local function fireRemote(name, ...)
+	local r = findRemote(name)
+	if not r then
+		setStatus(name .. " not found")
+		return false
+	end
+	if not r:IsA("RemoteEvent") then
+		setStatus(name .. " is not a RemoteEvent")
+		return false
+	end
+	local ok, err = pcall(r.FireServer, r, ...)
+	if not ok then
+		setStatus(name .. " fire failed: " .. string.sub(tostring(err), 1, 80))
+		return false
+	end
+	return true
+end
+
+-- Scan a signal payload for match/token/poll ids (field names vary).
+local function scanIds(tbl, depth, budget)
+	if type(tbl) ~= "table" or depth > 2 or budget[1] <= 0 then return end
+	for k, v in pairs(tbl) do
+		budget[1] = budget[1] - 1
+		if budget[1] <= 0 then return end
+		local lk = string.lower(tostring(k))
+		if (lk == "logicalmatchid" or lk == "matchid" or lk == "match") and (type(v) == "string" or type(v) == "number") then
+			lastMatchId = v
+		elseif (lk == "runtoken" or lk == "token") and (type(v) == "string" or type(v) == "number") then
+			lastRunToken = v
+		elseif (lk == "pollid" or lk == "poll_id") and (type(v) == "string" or type(v) == "number") then
+			lastPollId = v
+		elseif type(v) == "table" then
+			scanIds(v, depth + 1, budget)
+		end
+	end
+end
+
+local function onSignal(...)
+	local args = table.pack(...)
+	local payload = args[1]
+	local kind = "?"
+	if type(payload) == "table" then
+		kind = tostring(payload.kind or payload.type or "?")
+		scanIds(payload, 0, { 300 })
+	end
+	if signalOn then
+		log("[Signal] kind=" .. kind .. " payload=" .. short(payload))
+		if lastMatchId or lastRunToken then
+			log("[Signal] stored match/token: " .. tostring(lastMatchId) .. " / " .. tostring(lastRunToken))
+		end
+		if lastPollId then
+			log("[Signal] stored poll id: " .. tostring(lastPollId))
+		end
+	end
+end
+
+local function connectSignal()
+	if signalConn then return end
+	local r = findRemote("ClientSignal")
+	if not r then
+		setStatus("ClientSignal not found")
+		return false
+	end
+	signalConn = r.OnClientEvent:Connect(onSignal)
+	log("Signal watch connected (always stores match/token/poll ids)")
+	return true
+end
+
+-- ================= remote spy (observation only) =================
+local function argSummary(args)
+	local parts = {}
+	for i, a in ipairs(args) do
+		if i > 5 then break end
+		parts[#parts + 1] = short(a)
+	end
+	local s = table.concat(parts, " | ")
+	if #s > 400 then s = string.sub(s, 1, 400) .. "..." end
+	return s
+end
+
+local function setSpy(on)
+	spyOn = on
+	if not on then return end
+	if spyOld then return end
+	local ok, mt = pcall(getrawmetatable, game)
+	if not ok or not mt then
+		setStatus("Spy unavailable in this executor")
+		return
+	end
+	pcall(setreadonly, mt, false)
+	spyOld = mt.__namecall
+	local wrap = newcclosure or function(f) return f end
+	mt.__namecall = wrap(function(self, ...)
+		local method = getnamecallmethod()
+		if spyOn and (method == "FireServer" or method == "InvokeServer") then
+			local nm = self.Name
+			if nm ~= "MouseTarget" then
+				if method == "InvokeServer" then
+					local res = table.pack(spyOld(self, ...))
+					log("[Spy] " .. method .. " " .. self.ClassName .. ":" .. nm .. " args: " .. argSummary(table.pack(...)) .. " -> " .. argSummary(res))
+					return table.unpack(res, 1, res.n)
+				else
+					log("[Spy] " .. method .. " " .. self.ClassName .. ":" .. nm .. " args: " .. argSummary(table.pack(...)))
+				end
+			end
+		end
+		return spyOld(self, ...)
+	end)
+	pcall(setreadonly, mt, true)
+	log("Remote Spy hooked (MouseTarget excluded)")
+end
+
+-- ================= ESP =================
+local function makeLabel(adornee, text)
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "TablesESP"
+	gui.Adornee = adornee
+	gui.Size = UDim2.new(0, 220, 0, 30)
+	gui.StudsOffset = Vector3.new(0, 3, 0)
+	gui.AlwaysOnTop = true
+	gui.MaxDistance = 0
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 0.4
+	label.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.TextSize = 14
+	label.Font = Enum.Font.GothamBold
+	label.Text = text
+	label.Parent = gui
+	gui.Parent = adornee
+	return gui, label
+end
+
+local function distTo(pos)
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return "?" end
+	return tostring(math.floor((hrp.Position - pos).Magnitude)) .. "m"
+end
+
+local function refreshESP()
+	for plr, data in pairs(playerLabels) do
+		local char = plr.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp or not plr.Parent then
+			if data.gui then data.gui:Destroy() end
+			playerLabels[plr] = nil
+		else
+			data.label.Text = plr.Name .. " (" .. distTo(hrp.Position) .. ")"
+		end
+	end
+	if espPlayersOn then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= player and not playerLabels[plr] then
+				local char = plr.Character
+				local hrp = char and char:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local gui, label = makeLabel(hrp, plr.Name)
+					playerLabels[plr] = { gui = gui, label = label }
+				end
+			end
+		end
+	end
+	for model, data in pairs(tableLabels) do
+		if not model.Parent then
+			if data.gui then data.gui:Destroy() end
+			tableLabels[model] = nil
+		else
+			data.label.Text = model.Name .. " (" .. distTo(data.pos) .. ")"
+		end
+	end
+end
+
+local function scanTables()
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Model") and string.match(inst.Name, "^Table_%d+$") and not tableLabels[inst] then
+			local anchor = inst.PrimaryPart
+			if not anchor then
+				for _, d in ipairs(inst:GetDescendants()) do
+					if d:IsA("BasePart") then
+						anchor = d
+						break
+					end
+				end
+			end
+			if anchor then
+				local pos = anchor.Position
+				local gui, label = makeLabel(anchor, inst.Name)
+				tableLabels[inst] = { gui = gui, label = label, pos = pos }
+			end
+		end
+	end
+	local n = 0
+	for _ in pairs(tableLabels) do n = n + 1 end
+	log("Table ESP scan done (" .. n .. " tables tracked)")
+end
+
+local function clearESP(tbl)
+	for _, data in pairs(tbl) do
+		if data.gui then data.gui:Destroy() end
+	end
+	table.clear(tbl)
+end
+
+-- ================= movement =================
+local function applySpeed()
+	if not speedOn then return end
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.WalkSpeed = 60
+	end
+end
+
+local function setNoclip(on)
+	noclipOn = on
+	if on then
+		if noclipConn then noclipConn:Disconnect() end
+		noclipConn = RunService.Stepped:Connect(function()
+			local char = player.Character
+			if not char then return end
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") then
+					part.CanCollide = false
+				end
+			end
+		end)
+	elseif noclipConn then
+		noclipConn:Disconnect()
+		noclipConn = nil
+	end
+end
+
+local function setInfJump(on)
+	infJumpOn = on
+	if on then
+		if jumpConn then jumpConn:Disconnect() end
+		jumpConn = UserInputService.JumpRequest:Connect(function()
+			local char = player.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum then
+				hum:ChangeState(Enum.HumanoidStateType.Jumping)
+			end
+		end)
+	elseif jumpConn then
+		jumpConn:Disconnect()
+		jumpConn = nil
+	end
+end
+
+-- ================= GUI =================
+local hud = (gethui and gethui()) or player:WaitForChild("PlayerGui")
+local old = hud:FindFirstChild("TablesHelperGui")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "TablesHelperGui"
+gui.DisplayOrder = 9999
+gui.ResetOnSpawn = false
+gui.Parent = hud
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 260, 0, 300)
+main.Position = UDim2.new(0.5, -130, 0.5, -150)
+main.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 32)
+titleBar.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -36, 1, 0)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 16
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "Tables Helper " .. VERSION
+title.Parent = titleBar
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.new(0, 30, 0, 30)
+minBtn.Position = UDim2.new(1, -32, 0, 1)
+minBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+minBtn.TextSize = 18
+minBtn.Font = Enum.Font.GothamBold
+minBtn.Text = "—"
+minBtn.Parent = titleBar
+
+local content = Instance.new("ScrollingFrame")
+content.Size = UDim2.new(1, -8, 1, -40)
+content.Position = UDim2.new(0, 4, 0, 36)
+content.BackgroundTransparency = 1
+content.ScrollBarThickness = 4
+content.AutomaticCanvasSize = Enum.AutomaticCanvasSize.Y
+content.CanvasSize = UDim2.new(0, 0, 0, 0)
+content.Parent = main
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 4)
+layout.Parent = content
+
+local function section(text)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.new(1, -8, 0, 20)
+	l.BackgroundTransparency = 1
+	l.TextColor3 = Color3.fromRGB(255, 220, 100)
+	l.TextSize = 14
+	l.Font = Enum.Font.GothamBold
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Text = text
+	l.Parent = content
+	return l
+end
+
+local function mkBtn(text, callback)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -8, 0, 28)
+	b.BackgroundColor3 = Color3.fromRGB(45, 45, 65)
+	b.TextColor3 = Color3.fromRGB(255, 255, 255)
+	b.TextSize = 15
+	b.Font = Enum.Font.GothamBold
+	b.Text = text
+	b.Parent = content
+	b.MouseButton1Click:Connect(callback)
+	return b
+end
+
+local function mkToggle(text, callback)
+	local state = false
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -8, 0, 28)
+	b.BackgroundColor3 = Color3.fromRGB(45, 45, 65)
+	b.TextColor3 = Color3.fromRGB(255, 255, 255)
+	b.TextSize = 15
+	b.Font = Enum.Font.GothamBold
+	b.Text = text .. ": OFF"
+	b.Parent = content
+	b.MouseButton1Click:Connect(function()
+		state = not state
+		b.Text = text .. (state and ": ON" or ": OFF")
+		b.BackgroundColor3 = state and Color3.fromRGB(30, 90, 50) or Color3.fromRGB(45, 45, 65)
+		callback(state)
+	end)
+	return b
+end
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -8, 0, 40)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(180, 180, 200)
+statusLabel.TextSize = 13
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextWrapped = true
+statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Text = "Ready. Everything OFF."
+statusLabel.Parent = content
+
+-- Build the menu (status label must exist before callbacks run, so
+-- create it first, then move it to the end of the list).
+statusLabel.Parent = nil
+
+section("STATE (reads)")
+mkBtn("Sync Player", function() dashboard("GetRuntimeState") end)
+mkBtn("Table States", function() dashboard("GetAllTableStates") end)
+mkBtn("Inventory", function() dashboard("GetInventoryData") end)
+mkBtn("Shop", function() dashboard("GetShopData") end)
+mkBtn("Milestones", function() dashboard("GetMilestoneData") end)
+mkBtn("Daily", function() dashboard("GetDailyData") end)
+mkBtn("Playtime", function() dashboard("GetPlaytimeData") end)
+mkBtn("Brainrot Index", function() dashboard("GetBrainrotIndexData") end)
+
+section("ACTIONS (tap only, confirmed args)")
+mkBtn("Special Reroll", function()
+	if not lastMatchId or not lastRunToken then
+		setStatus("No special risk seen yet — wait for the game to offer a reroll, then tap again.")
+		return
+	end
+	if fireRemote("SubmitAction", { kind = "special_reroll", logicalMatchId = lastMatchId, runToken = lastRunToken }) then
+		setStatus("Reroll fired (match " .. tostring(lastMatchId) .. ")")
+	end
+end)
+mkBtn("Poll Vote 1", function()
+	if not lastPollId then
+		setStatus("No poll seen yet — wait for a poll, then tap again.")
+		return
+	end
+	if fireRemote("PollVote", lastPollId, 1) then setStatus("Voted 1 on poll " .. tostring(lastPollId)) end
+end)
+mkBtn("Poll Vote 2", function()
+	if not lastPollId then
+		setStatus("No poll seen yet — wait for a poll, then tap again.")
+		return
+	end
+	if fireRemote("PollVote", lastPollId, 2) then setStatus("Voted 2 on poll " .. tostring(lastPollId)) end
+end)
+mkBtn("Continue: Yes", function()
+	if fireRemote("EndGameContinueState", true) then setStatus("Continue Yes fired") end
+end)
+mkBtn("Continue: No", function()
+	if fireRemote("EndGameContinueState", false) then setStatus("Continue No fired") end
+end)
+
+section("WATCH")
+mkToggle("Signal Watch", function(on)
+	signalOn = on
+	if on then connectSignal() end
+end)
+mkToggle("Remote Spy", function(on)
+	setSpy(on)
+end)
+
+section("ESP")
+mkToggle("Player ESP", function(on)
+	espPlayersOn = on
+	if not on then clearESP(playerLabels) end
+end)
+mkToggle("Table ESP", function(on)
+	espTablesOn = on
+	if on then
+		scanTables()
+	else
+		clearESP(tableLabels)
+	end
+end)
+
+section("MOVEMENT")
+mkToggle("Speed 60", function(on)
+	speedOn = on
+	if on then
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then savedSpeed = hum.WalkSpeed end
+		applySpeed()
+	else
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.WalkSpeed = savedSpeed end
+	end
+end)
+mkToggle("Inf Jump", function(on) setInfJump(on) end)
+mkToggle("NoClip", function(on) setNoclip(on) end)
+
+mkBtn("Close", function()
+	setNoclip(false)
+	setInfJump(false)
+	if signalConn then signalConn:Disconnect() signalConn = nil end
+	spyOn = false
+	clearESP(playerLabels)
+	clearESP(tableLabels)
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and speedOn then hum.WalkSpeed = savedSpeed end
+	gui:Destroy()
+end)
+
+statusLabel.Parent = content
+
+minBtn.MouseButton1Click:Connect(function()
+	content.Visible = not content.Visible
+	minBtn.Text = content.Visible and "—" or "+"
+end)
+
+-- Background loops
+charConn = player.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	applySpeed()
+end)
+
+task.spawn(function()
+	local tick = 0
+	while gui.Parent do
+		task.wait(1)
+		tick = tick + 1
+		if espPlayersOn or espTablesOn then
+			refreshESP()
+			if espTablesOn and tick % 10 == 0 then
+				scanTables()
+			end
+		end
+	end
+end)
+
+-- Signal ids are stored even with watch display off, so the action
+-- buttons work without the log spam.
+connectSignal()
+
+log(VERSION .. " ready — everything OFF, nothing auto-fires.")
+setStatus("Ready. Tap a STATE button to read game data.")
