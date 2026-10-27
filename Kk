@@ -1,12 +1,16 @@
--- Tables Helper v1.0
+-- Tables Helper v1.1
 -- Built from the Oct 26, 2026 remote breakdown (new brainrot tables game).
+-- v1.1 fix: v1.0 crashed at GUI build because Enum.AutomaticCanvasSize
+-- does not resolve on this client; the canvas is now sized by hand from
+-- UIListLayout.AbsoluteContentSize. Delete the v1.0 copy in Delta.
 -- Plain GUI, everything OFF, NOTHING auto-fires. Every action is a tap.
 -- Safe reads: Get* RemoteFunctions. Confirmed actions only (see below).
 -- Deliberately NOT included: RunCommand/admin commands, GrantTestBrainrots,
 -- StudioResetPlayerData, and every gameplay remote whose args are unknown
 -- (SitAtTable, LeaveTable, RebirthAction, RollKeyCrate, BuyChair, claims...).
 -- Those unlock in v1.1 once Remote Spy captures their real args.
--- Delete no older copy: this is the first version of this script. 
+-- Delete no older copy: this is the first version of this script.
+
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -14,7 +18,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
-local VERSION = "v1.0"
+local VERSION = "v1.1"
 local TAG = "[Tables] "
 
 local function log(msg)
@@ -443,7 +447,6 @@ content.Size = UDim2.new(1, -8, 1, -40)
 content.Position = UDim2.new(0, 4, 0, 36)
 content.BackgroundTransparency = 1
 content.ScrollBarThickness = 4
-content.AutomaticCanvasSize = Enum.AutomaticCanvasSize.Y
 content.CanvasSize = UDim2.new(0, 0, 0, 0)
 content.Parent = main
 
@@ -607,6 +610,19 @@ mkBtn("Close", function()
 end)
 
 statusLabel.Parent = content
+
+-- v1.1: Enum.AutomaticCanvasSize does not resolve on this client
+-- (v1.0 died on it at line 446, before any button was built).
+-- Size the canvas by hand from the list layout instead.
+local function updateCanvas()
+	content.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 8)
+end
+layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvas)
+task.defer(updateCanvas)
+task.spawn(function()
+	task.wait(0.5)
+	updateCanvas()
+end)
 
 minBtn.MouseButton1Click:Connect(function()
 	content.Visible = not content.Visible
